@@ -362,6 +362,12 @@ def _js_ternary(cndn, if_true=True, if_false=False):
 _NaN = float('nan')
 _Infinity = float('inf')
 
+compat_str, compat_basestring, compat_chr = (
+    str, (str, bytes), chr
+)
+
+compat_numeric_types = (int, float, complex)
+
 def _js_typeof(expr):
     with compat_contextlib_suppress(TypeError, KeyError):
         return {
@@ -447,6 +453,7 @@ _ALL_OPERATORS = {**_OPERATORS,  **_UNARY_OPERATORS_X}
 _NAME_RE = r'[a-zA-Z_$][\w$]*'
 _MATCHING_PARENS = dict(zip(*zip('()', '{}', '[]')))
 _QUOTES = '\'"/'
+_NESTED_BRACKETS = r'[^[\]]+(?:\[[^[\]]+(?:\[[^\]]+\])?\])?'
 
 
 class JS_Undefined:
@@ -480,7 +487,7 @@ class LocalNameSpace(collections.ChainMap):
     def __delitem__(self, key):
         raise NotImplementedError('Deleting is not supported')
 
-def _extract_player_js_global_var(jscode):
+def extract_player_js_global_var(jscode):
     global_var = re.search(
         r'''(?x)
             (?P<q1>["\'])use\s+strict(?P=q1);\s*
@@ -495,12 +502,12 @@ def _extract_player_js_global_var(jscode):
         ''', jscode)
 
     if global_var:
-        return global_var.group('code')
+        return global_var.group('code'), global_var.group("name"), global_var.group("value")
     else:
-        return None
+        return None, None, None
 
 def _fixup_n_function_code(argnames, code, full_code):
-    global_var = _extract_player_js_global_var(full_code)
+    global_var, _, _ = extract_player_js_global_var(full_code)
     if global_var:
         code = global_var + '; ' + code
 
@@ -878,10 +885,33 @@ class JSInterpreter:
                     return ret, True
             return ret, False
 
-        r = rf'''(?x)
+        p =fr'''(?x)
+                (?P<out>{_NAME_RE})(?:\[(?P<index>{_NESTED_BRACKETS})\])?\s*
+                (?P<op>{"|".join(map(re.escape, set(_OPERATORS) - _COMP_OPERATORS))})?
+                =(?!=)(?P<expr>.*)$
+            '''
+        m = re.match(p, expr)
+        if m:  # We are assigning a value to a variable
+            left_val = local_vars.get(m.group('out'))
+
+            if not m.group('index'):
+                local_vars[m.group('out')] = self._operator(
+                    m.group('op'), left_val, m.group('expr'), expr, local_vars, allow_recursion)
+                return local_vars[m.group('out')], should_return
+            elif left_val in (None, JS_Undefined):
+                raise self.Exception(f'Cannot index undefined variable {m.group("out")}', expr)
+
+            idx = self.interpret_expression(m.group('index'), local_vars, allow_recursion)
+            if not isinstance(idx, (int, float)):
+                raise self.Exception(f'List index {idx} must be integer', expr)
+            idx = int(idx)
+            left_val[idx] = self._operator(
+                m.group('op'), self._index(left_val, idx), m.group('expr'), expr, local_vars, allow_recursion)
+            return left_val[idx], should_return
+
+        for m in re.finditer(rf'''(?x)
                 (?P<pre_sign>\+\+|--)(?P<var1>{_NAME_RE})|
-                (?P<var2>{_NAME_RE})(?P<post_sign>\+\+|--)'''
-        for m in re.finditer(r, expr):
+                (?P<var2>{_NAME_RE})(?P<post_sign>\+\+|--)''', expr):
             var = m.group('var1') or m.group('var2')
             start, end = m.span()
             sign = m.group('pre_sign') or m.group('post_sign')
@@ -894,24 +924,25 @@ class JSInterpreter:
         if not expr:
             return None, should_return
 
-        reg = fr'''(?x)
+        m = re.match(fr'''(?x)
             (?P<assign>
-                (?P<out>{_NAME_RE})(?:\[(?P<index>[^\]]+?)\])?\s*
+                (?P<out>{_NAME_RE})(?:\[(?P<index>{_NESTED_BRACKETS})\])?\s*
                 (?P<op>{"|".join(map(re.escape, set(_OPERATORS) - _COMP_OPERATORS))})?
                 =(?!=)(?P<expr>.*)$
             )|(?P<return>
                 (?!if|return|true|false|null|undefined|NaN)(?P<name>{_NAME_RE})$
+            )|(?P<attribute>
+                (?P<var>{_NAME_RE})(?:
+                    (?P<nullish>\?)?\.(?P<member>[^(]+)|
+                    \[(?P<member2>{_NESTED_BRACKETS})\]
+                )\s*
             )|(?P<indexing>
                 (?P<in>{_NAME_RE})\[(?P<idx>.+)\]$
-            )|(?P<attribute>
-                (?P<var>{_NAME_RE})(?:(?P<nullish>\?)?\.(?P<member>[^(]+)|\[(?P<member2>[^\]]+)\])\s*
             )|(?P<function>
                 (?P<fname>{_NAME_RE})\((?P<args>.*)\)$
-            )'''
-        m = re.match(reg, expr)
+            )''', expr)
         if m and m.group('assign'):
-            out = m.group('out')
-            left_val = local_vars.get(out)
+            left_val = local_vars.get(m.group('out'))
 
             if not m.group('index'):
                 local_vars[m.group('out')] = self._operator(
@@ -984,7 +1015,7 @@ class JSInterpreter:
                 if obj is NO_DEFAULT:
                     if variable not in self._objects:
                         try:
-                            self._objects[variable] = self.extract_object(variable)
+                            self._objects[variable] = self.extract_object(variable, local_vars)
                         except self.Exception:
                             if not nullish:
                                 raise
@@ -1133,7 +1164,7 @@ class JSInterpreter:
         code = global_var.group('val')
         return code
 
-    def extract_object(self, objname):
+    def extract_object(self, objname, *global_stack):
         _FUNC_NAME_RE = r'''(?:[a-zA-Z$0-9]+|"[a-zA-Z$0-9]+"|'[a-zA-Z$0-9]+')'''
         obj = {}
         obj_m = re.search(
@@ -1147,14 +1178,16 @@ class JSInterpreter:
             raise self.Exception(f'Could not find object {objname}')
         fields = obj_m.group('fields')
         # Currently, it only supports function definitions
-        r = r'''(?x)
+        fields_m = re.finditer(
+            r'''(?x)
                 (?P<key>%s)\s*:\s*function\s*\((?P<args>(?:%s|,)*)\){(?P<code>[^}]+)}
-            ''' % (_FUNC_NAME_RE, _NAME_RE)
-        fields_m = re.finditer(r, fields)
+            ''' % (_FUNC_NAME_RE, _NAME_RE),
+            fields)
         for f in fields_m:
             argnames = f.group('args').split(',')
             name = remove_quotes(f.group('key'))
-            obj[name] = function_with_repr(self.build_function(argnames, f.group('code')), f'F<{name}>')
+            obj[name] = function_with_repr(
+                self.build_function(argnames, f.group('code'), *global_stack), f'F<{name}>')
 
         return obj
 
